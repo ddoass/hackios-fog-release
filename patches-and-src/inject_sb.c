@@ -37,6 +37,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -65,6 +66,9 @@ say(const char *format, ...)
 	va_start(ap, format);
 	n = vsnprintf(line, sizeof(line), format, ap);
 	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
@@ -574,11 +578,11 @@ say_all_threads(void)
 static void *
 threads_watchdog(void *argument)
 {
-	double seconds = *(double *)argument;
+	unsigned seconds = *(unsigned *)argument;
 
 	free(argument);
 	for (;;) {
-		sleep((unsigned)seconds);
+		sleep(seconds);
 		say_all_threads();
 	}
 	return NULL;
@@ -588,33 +592,43 @@ static void
 watch_threads(const char *arguments)
 {
 	const char *setting = strstr(arguments, "sb_threads=");
+	CFRunLoopObserverRef observer;
 	pthread_t thread;
-	double *seconds;
+	char *end;
+	double interval;
+	unsigned *seconds, period;
 
 	if (setting == NULL || (setting != arguments && setting[-1] != ' ')) {
 		return;
 	}
+	setting += 11;
+	interval = strtod(setting, &end);
+	if (end == setting || (*end != 0 && *end != ' ') || !(interval > 0 && interval <= UINT_MAX)) {
+		return;
+	}
+	period = interval < 1 ? 1 : (unsigned)interval;
 	if ((seconds = malloc(sizeof(*seconds))) == NULL) {
 		return;
 	}
-	*seconds = atof(setting + 11);
-	if (*seconds <= 0) {
-		free(seconds);
-		return;
-	}
+	*seconds = period;
 	if (timebase.denom == 0) {
 		mach_timebase_info(&timebase);
 	}
 	sb_main_thread = mach_thread_self();    /* this constructor runs on the main thread */
-	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, 0,
-	    main_woke_note, NULL), kCFRunLoopCommonModes);
 	if (pthread_create(&thread, NULL, threads_watchdog, seconds) != 0) {
+		mach_port_deallocate(mach_task_self(), sb_main_thread);
+		sb_main_thread = MACH_PORT_NULL;
 		free(seconds);
 		say("hakios: threads: no watchdog\n");
 		return;
 	}
 	pthread_detach(thread);
-	say("hakios: threads: a stack of every thread every %.0f s\n", *seconds);
+	observer = CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, 0, main_woke_note, NULL);
+	if (observer != NULL) {
+		CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+		CFRelease(observer);
+	}
+	say("hakios: threads: a stack of every thread every %u s\n", period);
 }
 
 static void
@@ -1391,21 +1405,40 @@ switcher_wallpaper_overlay(id self, SEL selector)
 	}
 }
 
+static size_t __attribute__((format(printf, 4, 5)))
+append_layer_text(char *buffer, size_t size, size_t used, const char *format, ...)
+{
+	va_list ap;
+	int written;
+
+	if (size == 0 || used >= size - 1) {
+		return used;
+	}
+	va_start(ap, format);
+	written = vsnprintf(buffer + used, size - used, format, ap);
+	va_end(ap);
+	if (written < 0) {
+		buffer[used] = '\0';
+		return used;
+	}
+	return (size_t)written >= size - used ? size - 1 : used + (size_t)written;
+}
+
 static void
 layer_filter(id filter, const char *what, int depth)
 {
 	static const char *const inputs[] = { "inputColorMatrix", "inputRadius", "inputAmount", "inputColor", "inputAngle",
 		                              "inputPremultipliedValues", "inputNormalizeEdges", "inputReversed" };
-	char line[1024];
+	char line[1024] = "";
 	size_t n;
 
 	if (!class_respondsToSelector(object_getClass(filter), sel_registerName("type"))) {
 		say("hakios: layers%s: %*s  %s %s\n", layers_of, 2 * depth, "", what, text_of(filter));     /* a name alone */
 		return;
 	}
-	n = (size_t)snprintf(line, sizeof(line), "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
+	n = append_layer_text(line, sizeof(line), 0, "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
 	    text_of(SEND(id, filter, "name")), SEND(BOOL, filter, "isEnabled") ? "" : " (disabled)");
-	for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]) && n < sizeof(line); i++) {
+	for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]) && n < sizeof(line) - 1; i++) {
 		id key = SEND1(id, objc_getClass("NSString"), "stringWithUTF8String:", const char *, inputs[i]);
 		id value = SEND1(id, filter, "valueForKey:", id, key);
 		float m[20];
@@ -1415,11 +1448,11 @@ layer_filter(id filter, const char *what, int depth)
 		}
 		if (i == 0 && class_respondsToSelector(object_getClass(value), sel_registerName("CAColorMatrixValue"))) {
 			SEND1(void, value, "getValue:", void *, m);
-			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s [%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g | "
+			n = append_layer_text(line, sizeof(line), n, " %s [%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g | "
 			    "%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g]", inputs[i], m[0], m[1], m[2], m[3], m[4], m[5], m[6],
 			    m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18], m[19]);
 		} else {
-			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s %s", inputs[i], text_of(value));
+			n = append_layer_text(line, sizeof(line), n, " %s %s", inputs[i], text_of(value));
 		}
 	}
 	say("hakios: layers%s: %*s  %s\n", layers_of, 2 * depth, "", line);
@@ -1438,7 +1471,7 @@ layer_line(id layer, const char *role, int depth)
 	size_t n = 0;
 
 	if (SEND(BOOL, layer, "isHidden")) {
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " HIDDEN");
+		n = append_layer_text(more, sizeof(more), n, " HIDDEN");
 	}
 	if (contents != NULL) {
 		id text = (id)CFCopyDescription((CFTypeRef)contents);
@@ -1463,7 +1496,7 @@ layer_line(id layer, const char *role, int depth)
 			flat[k++] = *from++;
 		}
 		flat[k] = 0;
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %s", flat);
+		n = append_layer_text(more, sizeof(more), n, " contents %s", flat);
 		CFRelease((CFTypeRef)text);
 	}
 	if (contents != NULL && class_respondsToSelector(object_getClass(layer), sel_registerName("contentsMultiplyColor")) &&
@@ -1471,33 +1504,33 @@ layer_line(id layer, const char *role, int depth)
 		id text = (id)CFCopyDescription(SEND(void *, layer, "contentsMultiplyColor"));
 		const char *numbers = strstr(text_of(text), "( ");
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " times %.40s", numbers ? numbers : "?");
+		n = append_layer_text(more, sizeof(more), n, " times %.40s", numbers ? numbers : "?");
 		CFRelease((CFTypeRef)text);
 	}
 	if (colour != NULL) {
 		id text = (id)CFCopyDescription(colour);
 		const char *numbers = strstr(text_of(text), "( ");
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " colour %.40s", numbers ? numbers : "?");
+		n = append_layer_text(more, sizeof(more), n, " colour %.40s", numbers ? numbers : "?");
 		CFRelease((CFTypeRef)text);
 	}
 	if (strcmp(class_name, "CAPortalLayer") == 0) {
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " PORTAL of %p%s%s", (void *)SEND(id, layer, "sourceLayer"),
+		n = append_layer_text(more, sizeof(more), n, " PORTAL of %p%s%s", (void *)SEND(id, layer, "sourceLayer"),
 		    SEND(BOOL, layer, "hidesSourceLayer") ? " (hides it)" : "", SEND(BOOL, layer, "matchesOpacity") ? " (its opacity)" : "");
 	} else if (strcmp(class_name, "CABackdropLayer") == 0) {
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " BACKDROP group \"%s\" scale %g%s", text_of(SEND(id, layer, "groupName")),
+		n = append_layer_text(more, sizeof(more), n, " BACKDROP group \"%s\" scale %g%s", text_of(SEND(id, layer, "groupName")),
 		    SEND(double, layer, "scale"), SEND(BOOL, layer, "captureOnly") ? " (capture only)" : "");
 	} else if (strcmp(class_name, "CAGradientLayer") == 0) {
 		struct { double x, y; } from = SEND(typeof(from), layer, "startPoint"), to = SEND(typeof(to), layer, "endPoint");
 		id colours = SEND(id, layer, "colors");
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " GRADIENT %s from %g,%g to %g,%g at %.40s:", text_of(SEND(id, layer, "type")),
+		n = append_layer_text(more, sizeof(more), n, " GRADIENT %s from %g,%g to %g,%g at %.40s:", text_of(SEND(id, layer, "type")),
 		    from.x, from.y, to.x, to.y, text_of(SEND(id, layer, "locations")));
-		for (long i = 0; colours != NULL && i < SEND(long, colours, "count") && n < sizeof(more); i++) {
+		for (long i = 0; colours != NULL && i < SEND(long, colours, "count") && n < sizeof(more) - 1; i++) {
 			id text = (id)CFCopyDescription((CFTypeRef)SEND1(id, colours, "objectAtIndex:", long, i));
 			const char *numbers = strstr(text_of(text), "( ");
 
-			n += (size_t)snprintf(more + n, sizeof(more) - n, " %.30s", numbers ? numbers : "?");
+			n = append_layer_text(more, sizeof(more), n, " %.30s", numbers ? numbers : "?");
 			CFRelease((CFTypeRef)text);
 		}
 	} else if (strcmp(class_name, "CAShapeLayer") == 0) {
@@ -1505,7 +1538,7 @@ layer_line(id layer, const char *role, int depth)
 		id text_stroke = stroke ? (id)CFCopyDescription(stroke) : NULL, text_fill = fill ? (id)CFCopyDescription(fill) : NULL;
 		const char *ns = text_stroke ? strstr(text_of(text_stroke), "( ") : NULL, *nf = text_fill ? strstr(text_of(text_fill), "( ") : NULL;
 
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " SHAPE line %g stroke %.30s fill %.30s ends %g-%g", SEND(double, layer,
+		n = append_layer_text(more, sizeof(more), n, " SHAPE line %g stroke %.30s fill %.30s ends %g-%g", SEND(double, layer,
 		    "lineWidth"), ns ? ns : "-", nf ? nf : "-", SEND(double, layer, "strokeStart"), SEND(double, layer, "strokeEnd"));
 		if (text_stroke != NULL) {
 			CFRelease((CFTypeRef)text_stroke);
@@ -1514,7 +1547,7 @@ layer_line(id layer, const char *role, int depth)
 			CFRelease((CFTypeRef)text_fill);
 		}
 	} else if (strcmp(class_name, "CALayerHost") == 0) {
-		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
+		n = append_layer_text(more, sizeof(more), n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
 		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
 		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
 	}
@@ -1524,17 +1557,17 @@ layer_line(id layer, const char *role, int depth)
 		id delegate = SEND(id, layer, "delegate");
 
 		if (delegate != NULL) {
-			n += (size_t)snprintf(more + n, sizeof(more) - n, " of %s", object_getClassName(delegate));
+			n = append_layer_text(more, sizeof(more), n, " of %s", object_getClassName(delegate));
 		}
 	}
 	{
 		id keys = SEND(id, layer, "animationKeys");
 
 		if (SEND(BOOL, layer, "shouldRasterize")) {
-			n += (size_t)snprintf(more + n, sizeof(more) - n, " RASTERIZED");
+			n = append_layer_text(more, sizeof(more), n, " RASTERIZED");
 		}
-		for (long i = 0; keys != NULL && i < SEND(long, keys, "count") && n < sizeof(more); i++) {
-			n += (size_t)snprintf(more + n, sizeof(more) - n, "%s%s", i == 0 ? " ANIMATIONS " : ",",
+		for (long i = 0; keys != NULL && i < SEND(long, keys, "count") && n < sizeof(more) - 1; i++) {
+			n = append_layer_text(more, sizeof(more), n, "%s%s", i == 0 ? " ANIMATIONS " : ",",
 			    text_of(SEND1(id, keys, "objectAtIndex:", long, i)));
 		}
 	}
@@ -2056,6 +2089,7 @@ sb_uncaught_exception(id exception)
 {
 	const char *name = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("name")));
 	const char *reason = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("reason")));
+	size_t reason_length = reason != NULL ? strlen(reason) : 0;
 	id addresses;
 	unsigned long frames, frame;
 
@@ -2065,7 +2099,7 @@ sb_uncaught_exception(id exception)
 	 * callStackSymbols here).
 	 */
 	say("hakios: EXC %s\n", name);
-	for (size_t at = 0; reason != NULL && reason[at] != 0; at += 60) {
+	for (size_t at = 0; at < reason_length; at += 60) {
 		say("hakios: EXC %.*s\n", 60, reason + at);
 	}
 	addresses = ((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("callStackReturnAddresses"));

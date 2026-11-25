@@ -2,11 +2,12 @@
 
 **Status: WORKING — SpringBoard reaches the iOS home screen on the phone.**
 
-This is a self-contained, RAM-only release of the HackiOS bring-up for the Xiaomi Redmi 10C
+This release packages the HackiOS bring-up for the Xiaomi Redmi 10C
 (codename `fog`, Qualcomm Snapdragon 680 / SM6225). It boots the XNU 8796.121.2 kernel
 (built from the Redwood tree) together with the iOS 16.5 userland, and gets SpringBoard from the
-BootUI Apple logo all the way to a rendered, interactive home screen. Nothing is flashed: every
-image is uploaded into RAM over `fastboot`.
+BootUI Apple logo all the way to a rendered, interactive home screen. The launcher uploads
+the boot images into RAM. The system also requires a `darwin` image in the phone's
+`userdata`, which the guest can write to during a run.
 
 | Evidence | File |
 |---|---|
@@ -50,8 +51,11 @@ The working trees these files were taken from:
 - userland: `/home/feolov/Projects/hackios-fog-workspace/hakios-xnu-kernel`
 - kernel: `/home/feolov/Projects/hackios-redwood/hackios-xnu-kernel`
 
-Full diffs against the commits above are in [`patches-and-src/userland.patch`](patches-and-src/userland.patch)
-and [`patches-and-src/kernel.patch`](patches-and-src/kernel.patch).
+The source diffs against those commits are in [`patches-and-src/userland.patch`](patches-and-src/userland.patch)
+and [`patches-and-src/kernel.patch`](patches-and-src/kernel.patch). The release does not include
+the changed binary preferences for `com.apple.migration.plist`, `com.apple.purplebuddy.plist`
+and `com.apple.springboard.plist`. Source changes require a rebuild before they affect the prebuilt
+images.
 
 ---
 
@@ -60,7 +64,9 @@ and [`patches-and-src/kernel.patch`](patches-and-src/kernel.patch).
 ```
 hackios-fog-release/
 ├── README.md
-├── run.sh                        # one-command RAM-only boot + run (uses only prebuilt/)
+├── run.sh                        # boots the prebuilt images and collects logs
+├── xnuloader/
+│   └── loader.efi                # standalone EFI build, separate from the bundled boot image
 ├── prebuilt/
 │   ├── mach.development.bcm2837  # XNU 8796.121.2 kernel, DEVELOPMENT_ARM64_BCM2837
 │   ├── xnu-usb-fog.img           # UEFI + xnuloader loader image
@@ -86,9 +92,10 @@ hackios-fog-release/
 Artifact sizes (approx.): kernel 15 MB, UEFI 2.0 MB, `root.apfs` 6.3 MB, payload 21 MB,
 `flashboot.apfs` 976 MB, `xl` 22 KB. Integrity hashes are in `prebuilt/SHA256SUMS`.
 
-> `flashboot.apfs` is large (≈976 MB) and is **not tracked by this repository**
-> (see `.gitignore`). Put your own copy into `prebuilt/` before running, or rebuild it with
-> `FLASHBOOT=1 ./build.sh` in the userland tree.
+> Download [`flashboot.apfs` from v1.0](https://github.com/ddoass/hackios-fog-release/releases/download/v1.0-homescreen/flashboot.apfs)
+> into `prebuilt/`. The file is about 976 MiB and is stored as a release asset.
+> The [v1.1 release](https://github.com/ddoass/hackios-fog-release/releases/tag/v1.1-homescreen)
+> provides the separate system image and describes the one-time `darwin` setup.
 
 ---
 
@@ -150,17 +157,18 @@ SpringBoard's own layers both reach the panel (frame counter **1220+** in the ev
 
 ### Requirements
 
-- Linux host with `fastboot` and `adb` in `PATH`, `bash`, `flock`, `python3`.
-- The phone bootloader unlocked, USB debugging/ADB available from Android (or already in fastboot).
+- Linux host with `fastboot`, `bash`, `flock`, `timeout` and `python3` in `PATH`.
+- One Redmi 10C (`fog`) with its bootloader unlocked. Starting from Android requires USB debugging and `adb`.
+- `prebuilt/flashboot.apfs` on the host and the `darwin` image set up in the phone's `userdata`.
 - ~2 GB of free RAM on the phone (the resident image and the payload live there).
 
 ### One command
 
 ```bash
 cd hackios-fog-release
-./run.sh                    # full cycle, 2400 s of kernel time, log every 120 s
-SECS=600 ./run.sh           # shorter run
-SLICE=60 THREADS=120 ./run.sh
+./run.sh                    # collect logs for 2400 s, every 120 s
+SECS=600 ./run.sh           # collect logs for 600 s
+SLICE=60 ./run.sh           # collect logs every 60 s
 ```
 
 `run.sh` performs the whole cycle:
@@ -171,8 +179,11 @@ SLICE=60 THREADS=120 ./run.sh
 4. `prebuilt/xl ramdisk prebuilt/flashboot.apfs` (resident image, once per session);
 5. `fastboot stage prebuilt/run-sb-unblock.bin`;
 6. `fastboot oem run`;
-7. every `SLICE` seconds runs `prebuilt/xl log` and slices the kernel log into
-   `logs/run-sb-unblock.log`, taking a screenshot every other slice.
+7. collects the kernel log every `SLICE` seconds into `logs/run-sb-unblock.log`
+   (or `OUT`), taking a screenshot every other slice.
+
+`SECS` sets the observation window on the host. The prebuilt payload's kernel timer is fixed
+at 2400 seconds, so ending observation earlier leaves the guest running.
 
 ### Watching it
 
@@ -196,7 +207,7 @@ Expected timeline of a healthy run (guest clock):
 
 ```bash
 fastboot boot prebuilt/xnu-usb-fog.img
-# wait until `fastboot devices` shows xnuloader
+# wait until `prebuilt/xl state` prints loader
 prebuilt/xl ramdisk prebuilt/flashboot.apfs
 fastboot stage prebuilt/run-sb-unblock.bin
 fastboot oem run
@@ -212,8 +223,8 @@ applog=1 darwin_file=1 darwin_blocks=3145728 console=fbcon -v
 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 sb_threads=120
 ```
 
-Rebuilding the payload from a changed kernel or `root.apfs` needs the source tree
-(`userland/xnuloader/mkpayload.py`) and the files in `patches-and-src/`.
+Rebuilding the payload from a changed kernel or `root.apfs` needs the upstream source tree
+(`xnuloader/mkpayload.py`) and the files in `patches-and-src/`.
 
 ---
 
@@ -230,32 +241,28 @@ Rebuilding the payload from a changed kernel or `root.apfs` needs the source tre
   which is why `mapdb` never answers and is capped at 2 s. Enabling `restore_var` will make the next
   boots faster.
 - **Touch.** Input currently comes from the virtual USB touch screen; I2C touch on `fog` is planned.
-- **No persistence.** Everything is RAM-only by design. Nothing is written to the phone's flash.
+- **Storage.** The launcher stages its boot files in RAM. The `darwin` image and any guest
+  writes to it live in the phone's `userdata`.
 
 ---
 
-## 7. Reproducing the build
+## 7. Source build notes
 
-Userland (`root.apfs`, `libhakios*.dylib`, payload):
+The upstream userland build uses `xnu-clang` and the iPhoneOS 16.5 SDK. The release was built
+with `GL=1 RC_JOBS=rc.jobs.unlock` to enable the Mesa software renderer and select the
+release job list. Enabling `REST=1` starts extra jobs and starves XPC.
 
-```bash
-cd hakios-xnu-kernel/userland
-rm -f system.apfs && touch -d '2030-01-01' system.apfs
-GL=1 RC_JOBS=rc.jobs.unlock ./build.sh
-rm -f system.apfs
-```
-
-`GL=1` builds the Mesa software GL support; `REST=1` is deliberately **not** used (it starts 381
-on-demand jobs and starves XPC). The kernel image is built from the Redwood tree with the
-`DEVELOPMENT_ARM64_BCM2837` configuration.
+The kernel image was built from the Redwood tree with the `DEVELOPMENT_ARM64_BCM2837`
+configuration. Reproducing the bundled Fog UEFI image also requires the original device
+build inputs, which are outside this release.
 
 ---
 
 ## 8. Кратко по-русски
 
 Готовая сборка HackiOS для Xiaomi Redmi 10C (`fog`): нативный iOS 16.5 (20F66) на ядре XNU
-8796.121.2 из Redwood. Всё грузится **только в RAM** через `fastboot`, во флеш телефона ничего не
-пишется.
+8796.121.2 из Redwood. Скрипт загружает загрузочные образы в RAM через `fastboot`.
+Отдельный образ `darwin` хранится в `userdata` телефона, и система может писать в него.
 
 Что доведено до рабочего состояния:
 
@@ -269,6 +276,7 @@ on-demand jobs and starves XPC). The kernel image is built from the Redwood tree
 - исправлены sysctl-имена в `var_store.c` (`kern.hackios.*`);
 - рендер через Mesa OSMesa (`adreno=0 gl=1`), счётчик кадров > 1220.
 
-Запуск: `cd hackios-fog-release && ./run.sh` (переменные `SECS`, `SLICE`, `THREADS`). Скриншот
+Запуск: `cd hackios-fog-release && ./run.sh`. Переменные `SECS` и `SLICE` задают
+время наблюдения и интервал сбора логов. Скриншот
 рабочего стола — `evidence/ios16_5_homescreen_fog.png`. Ограничения: программный рендер, иконки
 без картинок, нет экрана блокировки, `/private/var` в памяти, тач — виртуальный USB.

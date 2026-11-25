@@ -97,7 +97,7 @@ index 384db1a..a3be563 100755
  # is in the middle of the phone's largest block of RAM, which XNU needs in one piece.
  lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 /out:$OUT ${OUT%.efi}.obj
 diff --git a/xnuloader/loader.c b/xnuloader/loader.c
-index 18a75f2..d3bb73f 100644
+index 18a75f2..0a5474b 100644
 --- a/xnuloader/loader.c
 +++ b/xnuloader/loader.c
 @@ -15,7 +15,9 @@
@@ -344,7 +344,7 @@ index 18a75f2..d3bb73f 100644
          "  mrs x9, sctlr_el1\n"
          "  bic x9, x9, #0x1\n"
          "  bic x9, x9, #0x4\n"
-@@ -2655,6 +2745,97 @@ static struct {
+@@ -2655,6 +2745,105 @@ static struct {
  	uint64_t base;
  	uint32_t width, height, stride;
  } SCREEN;
@@ -356,6 +356,7 @@ index 18a75f2..d3bb73f 100644
 +/* within a second, which fetch-logs.sh picks up over adb afterwards.         */
 +/* QEMU and phones without a framebuffer leave early: base 0 is "no display". */
 +
++#if __has_include("font16.h")
 +#include "font16.h"
 +
 +static void
@@ -413,6 +414,13 @@ index 18a75f2..d3bb73f 100644
 +		}
 +	}
 +}
++#else
++/* A source checkout without the generated font still captures the log. */
++static void
++console_draw(void)
++{
++}
++#endif
 +
 +static void
 +console_tick(void)
@@ -442,7 +450,7 @@ index 18a75f2..d3bb73f 100644
  static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
  static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
  static char last_result[64] = "idle";
-@@ -2913,7 +3094,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -2913,7 +3102,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	block_write_part = -1;
  	for (const char *c = pi.cmdline; *c; c++) {
  		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
@@ -451,7 +459,7 @@ index 18a75f2..d3bb73f 100644
  		}
  		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
  		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
-@@ -3091,7 +3272,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3091,7 +3280,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  
  	/* --- device tree ---------------------------------------------------- */
  	const struct platform *plat = PLAT;
@@ -460,7 +468,7 @@ index 18a75f2..d3bb73f 100644
  	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
  	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };
  	uint64_t reg2[2];
-@@ -3245,16 +3426,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3245,16 +3434,20 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
  	 */
  	uint64_t cpu_mpidr[8] = { kernel_mpidr };
@@ -484,7 +492,7 @@ index 18a75f2..d3bb73f 100644
  					continue;
  				}
  				state = psci_call(PSCI_AFFINITY_INFO, mpidr, 0, 0);
-@@ -3287,7 +3472,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3287,7 +3480,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
  		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
  		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
@@ -493,7 +501,7 @@ index 18a75f2..d3bb73f 100644
  			dt_prop_u32(&w, "small-core", 1);
  		}
  		dt_end(&w);
-@@ -3330,6 +3515,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
+@@ -3330,6 +3523,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
  	dt_end(&w);
  
  	uint32_t dt_len = (uint32_t)(w.cur - w.base);
@@ -504,7 +512,7 @@ index 18a75f2..d3bb73f 100644
  	ba->deviceTreeP = dt_pa - slide;
  	ba->deviceTreeLength = dt_len;
  	print("device tree %x len %x, boot_args %x, top %x\n", dt_pa, (uint64_t)dt_len, ba_pa, top);
-@@ -3808,11 +3997,16 @@ fb_command(char *cmd)
+@@ -3808,11 +4005,16 @@ fb_command(char *cmd)
  			set_result("running", cp, 0);
  			fb_reply("OKAY", "");
  			log_len = 0;
@@ -521,7 +529,7 @@ index 18a75f2..d3bb73f 100644
  		} else if (starts_with(cmd, "oem hang")) {
  			fb_reply("OKAY", "watchdog test: not petting any more");
  			for (;;) {
-@@ -3880,10 +4074,17 @@ static void
+@@ -3880,10 +4082,17 @@ static void
  usb_command_loop(void)
  {
  	screen_quiet = 1;
@@ -539,7 +547,7 @@ index 18a75f2..d3bb73f 100644
  		if (!usb_connected) {
  			usb_wait(0xff); /* returns on the next cable state change */
  			continue;
-@@ -4000,6 +4201,11 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4000,6 +4209,11 @@ efi_main(efi_handle image, efi_system_table *st)
  	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
  	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
  
@@ -551,7 +559,7 @@ index 18a75f2..d3bb73f 100644
  	PLAT = &platform_qemu_virt;
  	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
  	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
-@@ -4022,6 +4228,17 @@ efi_main(efi_handle image, efi_system_table *st)
+@@ -4022,6 +4236,17 @@ efi_main(efi_handle image, efi_system_table *st)
  	wdt_arm();
  
  	int have_payload = parse_payload(&pi, 0);

@@ -59,6 +59,7 @@
 #define XPACK           (512u << 10)            /* all the attributes of one file, packed */
 #define LINKS           8192                    /* names remembered for hard links */
 #define LINK_PATH       256
+#define DARWIN_EINTR    4                       /* mini.h exposes errno, but not its constants */
 /*
  * The file flags put back: the ones a tree of files can mean. UF_COMPRESSED is not among them
  * (a ramfs file is not a compressed HFS one, and the flag would make it read as empty), nor are
@@ -247,9 +248,12 @@ device_write(off_t where, const void *data, uint64_t n)
 	while (n > 0) {
 		ssize_t wrote = pwrite(fd, p, (size_t)n, where);
 
+		if (wrote < 0 && errno == DARWIN_EINTR) {
+			continue;
+		}
 		if (wrote <= 0) {
 			printf("var_store: writing %llu bytes at %lld: %s\n", (unsigned long long)n,
-			    (long long)where, strerror(errno));
+			    (long long)where, wrote == 0 ? "no progress" : strerror(errno));
 			return 0;
 		}
 		p += wrote;
@@ -267,9 +271,12 @@ device_read(off_t where, void *data, uint64_t n)
 	while (n > 0) {
 		ssize_t got = pread(fd, p, (size_t)n, where);
 
+		if (got < 0 && errno == DARWIN_EINTR) {
+			continue;
+		}
 		if (got <= 0) {
 			printf("var_store: reading %llu bytes at %lld: %s\n", (unsigned long long)n,
-			    (long long)where, strerror(errno));
+			    (long long)where, got == 0 ? "unexpected end of device" : strerror(errno));
 			return 0;
 		}
 		p += got;
@@ -402,17 +409,7 @@ in(void *data, uint64_t n)
 static int
 in_skip(uint64_t n)
 {
-	uint8_t waste[512];
-
-	while (n > 0) {
-		uint64_t piece = n > sizeof(waste) ? sizeof(waste) : n;
-
-		if (!in(waste, piece)) {
-			return 0;
-		}
-		n -= piece;
-	}
-	return 1;
+	return in(NULL, n);
 }
 
 static int
@@ -436,7 +433,7 @@ stream_start(int slot, uint64_t bytes)
 
 /* ---- the slots ---- */
 
-/* The slot's header, if it is one of ours and says of itself what it should. */
+/* 1 for a valid header, 0 for an invalid header, -1 if the header could not be read. */
 static int
 read_head(int slot, struct head *into)
 {
@@ -444,7 +441,7 @@ read_head(int slot, struct head *into)
 	struct head *h = (struct head *)block;
 
 	if (!device_read(slot_at(slot), block, BLOCK)) {
-		return 0;
+		return -1;
 	}
 	if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0 || h->version != HEAD_VERSION ||
 	    h->slot != (uint32_t)slot || h->bytes > (uint64_t)SLOT_BYTES - BLOCK ||
@@ -457,14 +454,18 @@ read_head(int slot, struct head *into)
 
 /* The newest slot whose header checks out, or -1. */
 static int
-newest(struct head *out_head)
+newest(struct head *out_head, int *read_failed)
 {
 	int best = -1;
 
 	for (int slot = 0; slot < SLOTS; slot++) {
 		struct head h;
+		int ok = read_head(slot, &h);
 
-		if (!read_head(slot, &h)) {
+		if (ok < 0) {
+			*read_failed = 1;
+		}
+		if (ok <= 0) {
 			continue;
 		}
 		if (best < 0 || h.generation > out_head->generation) {
@@ -528,6 +529,20 @@ link_name(uint64_t ino, const char *relative)
  */
 static uint8_t xpack[XPACK];
 
+static int
+buffer_xattr(uint64_t *used, const char *name, uint32_t namelen, const void *value, uint32_t vlen)
+{
+	if (*used + 8 + namelen + vlen > XPACK) {
+		return 0;
+	}
+	memcpy(xpack + *used, &namelen, sizeof(namelen));
+	memcpy(xpack + *used + 4, &vlen, sizeof(vlen));
+	memcpy(xpack + *used + 8, name, namelen);
+	memcpy(xpack + *used + 8 + namelen, value, vlen);
+	*used += 8 + namelen + vlen;
+	return 1;
+}
+
 static uint64_t
 pack_xattrs(uint32_t *count)
 {
@@ -541,22 +556,16 @@ pack_xattrs(uint32_t *count)
 		return 0;
 	}
 	for (ssize_t i = 0; i < n && i < (ssize_t)sizeof(names); i += (ssize_t)strlen(names + i) + 1) {
-		uint32_t namelen = (uint32_t)strlen(names + i), vlen;
+		uint32_t namelen = (uint32_t)strlen(names + i);
 		ssize_t size = getxattr(path, names + i, value, sizeof(value), 0, XATTR_NOFOLLOW);
 
 		if (size < 0) {
 			continue;
 		}
-		vlen = (uint32_t)size;
-		if (used + 8 + namelen + vlen > XPACK) {
+		if (!buffer_xattr(&used, names + i, namelen, value, (uint32_t)size)) {
 			skipped_big++;
 			continue;
 		}
-		memcpy(xpack + used, &namelen, sizeof(namelen));
-		memcpy(xpack + used + 4, &vlen, sizeof(vlen));
-		memcpy(xpack + used + 8, names + i, namelen);
-		memcpy(xpack + used + 8 + namelen, value, vlen);
-		used += 8 + namelen + vlen;
 		(*count)++;
 	}
 	return used;
@@ -584,6 +593,10 @@ pack_one(const char *relative, const struct stat *st)
 		if (n <= 0) {
 			return 1;
 		}
+		if ((size_t)n == sizeof(target)) {
+			printf("var_store: %s: link target is too long\n", path);
+			return 0;
+		}
 		kind = ENT_SYMLINK;
 		size = (uint64_t)n;
 		tail = target;
@@ -592,18 +605,20 @@ pack_one(const char *relative, const struct stat *st)
 	case S_IFREG:
 		kind = ENT_FILE;
 		size = (uint64_t)st->st_size;
+		in_fd = open(path, O_RDONLY, 0);
+		if (in_fd < 0) {
+			return 1;       /* gone, or not ours to read: it is not in the archive */
+		}
 		if (st->st_nlink > 1) {
 			first = link_name(st->st_ino, relative);
 			if (first != NULL) {
+				close(in_fd);
+				in_fd = -1;
 				kind = ENT_HARDLINK;
 				size = strlen(first);
 				tail = first;
 				break;
 			}
-		}
-		in_fd = open(path, O_RDONLY, 0);
-		if (in_fd < 0) {
-			return 1;       /* gone, or not ours to read: it is not in the archive */
 		}
 		break;
 	default:
@@ -649,7 +664,15 @@ pack_one(const char *relative, const struct stat *st)
 			uint64_t want = left > sizeof(piece) ? sizeof(piece) : left;
 			ssize_t got = read(in_fd, piece, (size_t)want);
 
-			if (got <= 0) {
+			if (got < 0) {
+				if (errno == DARWIN_EINTR) {
+					continue;
+				}
+				printf("var_store: %s: %s\n", path, strerror(errno));
+				close(in_fd);
+				return 0;
+			}
+			if (got == 0) {
 				/* the file shrank under us: the rest is zeros, so the archive stays whole */
 				memset(piece, 0, (size_t)want);
 				got = (ssize_t)want;
@@ -718,9 +741,9 @@ sort_names(uint32_t *at, uint64_t n)
 	}
 }
 
-/* Every name in the open directory into the arena, sorted. Returns the count, or -1 if it did not fit. */
+/* Every name in the open directory into the arena, sorted. Returns -1 if full or -2 on a read error. */
 static long
-gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t mark_n)
+gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_n)
 {
 	off_t position = 0;
 	ssize_t n;
@@ -736,8 +759,6 @@ gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t ma
 				continue;
 			}
 			if (arena_used + len + 1 > NAME_ARENA || names_used >= NAME_MAX_NAMES) {
-				arena_used = mark_a;
-				names_used = mark_n;
 				return -1;
 			}
 			name_at[names_used++] = (uint32_t)arena_used;
@@ -745,8 +766,66 @@ gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t ma
 			arena_used += len + 1;
 		}
 	}
+	if (n < 0) {
+		return -2;
+	}
 	sort_names(name_at + mark_n, names_used - mark_n);
 	return (long)(names_used - mark_n);
+}
+
+static int pack_tree(const char *relative);
+
+static int
+pack_child(const char *relative, const char *name)
+{
+	char child[MAX_PATH];
+	size_t base = strlen(path), rbase = strlen(relative), len = strlen(name);
+	int ok;
+
+	if (base + 1 + len >= MAX_PATH) {
+		printf("var_store: %s/%s: the path is too long\n", path, name);
+		return 1;
+	}
+	path[base] = '/';
+	memcpy(path + base + 1, name, len + 1);
+	if (rbase > 0) {
+		memcpy(child, relative, rbase);
+		child[rbase++] = '/';
+	}
+	memcpy(child + rbase, name, len + 1);
+	ok = pack_tree(child);
+	path[base] = 0;
+	return ok;
+}
+
+static int
+pack_unsorted(const char *relative, char *buf, size_t bufsize)
+{
+	int dir_fd = open(path, O_RDONLY | O_DIRECTORY, 0);
+	off_t position = 0;
+	ssize_t n;
+
+	if (dir_fd < 0) {
+		printf("var_store: %s: cannot reopen directory: %s\n", path, strerror(errno));
+		return 0;
+	}
+	while ((n = getdirentries(dir_fd, buf, bufsize, &position)) > 0) {
+		for (ssize_t i = 0; i < n;) {
+			struct dirent *d = (struct dirent *)(buf + i);
+			const char *name = d->d_name;
+
+			i += d->d_reclen;
+			if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0 && !pack_child(relative, name)) {
+				close(dir_fd);
+				return 0;
+			}
+		}
+	}
+	if (n < 0) {
+		printf("var_store: %s: cannot read directory: %s\n", path, strerror(errno));
+	}
+	close(dir_fd);
+	return n == 0;
 }
 
 /* relative: the path under ROOT, "" for ROOT itself. path holds the whole of it. */
@@ -756,7 +835,6 @@ pack_tree(const char *relative)
 	static char dirbuf[MAX_DEPTH][4096];    /* one read buffer a level */
 	static int depth;
 	struct stat st;
-	size_t base = strlen(path), rbase = strlen(relative);
 	int dir_fd, ok = 1;
 
 	if (lstat(path, &st) != 0) {
@@ -778,55 +856,66 @@ pack_tree(const char *relative)
 	depth++;
 	{
 		uint64_t mark_a = arena_used, mark_n = names_used;
-		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_a, mark_n);
+		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_n);
 
-		if (count < 0) {
-			/* more names than the arena holds: this one goes in whatever order it is given */
+		if (count == -2) {
+			printf("var_store: %s: cannot read directory: %s\n", path, strerror(errno));
+			ok = 0;
+		}
+		close(dir_fd);
+		if (count == -1) {
+			/* The first pass ran out of space. Reopen and walk from the beginning. */
+			arena_used = mark_a;
+			names_used = mark_n;
 			unsorted_dirs++;
+			ok = pack_unsorted(relative, dirbuf[depth - 1], sizeof(dirbuf[0]));
 		}
 		for (long k = 0; ok && k < count; k++) {
-			const char *name = name_arena + name_at[mark_n + k];
-			char child[MAX_PATH];           /* the caller's while this one recurses: not static */
-
-			if (base + 1 + strlen(name) >= MAX_PATH || rbase + 1 + strlen(name) >= MAX_PATH) {
-				printf("var_store: %s/%s: the path is too long\n", path, name);
-				continue;
-			}
-			path[base] = '/';
-			strcpy(path + base + 1, name);
-			if (rbase > 0) {
-				memcpy(child, relative, rbase);
-				child[rbase] = '/';
-				strcpy(child + rbase + 1, name);
-			} else {
-				strcpy(child, name);
-			}
-			ok = pack_tree(child);
-			path[base] = 0;
+			ok = pack_child(relative, name_arena + name_at[mark_n + k]);
 		}
 		arena_used = mark_a;
 		names_used = mark_n;
 	}
 	depth--;
-	close(dir_fd);
 	if (ok && relative[0] != 0 && lstat(path, &st) == 0) {
 		ok = pack_dirtime(relative, &st);
 	}
 	return ok;
 }
 
+static int pass(const struct head *h, int make);
+
 static int
 save(void)
 {
-	struct head old, h;
-	int slot, best;
+	struct head old, other, h;
+	int slot, best, other_ok, read_failed = 0;
+	uint64_t generation;
 	static uint8_t block[BLOCK];
 
 	memset(&old, 0, sizeof(old));
-	best = newest(&old);
+	best = newest(&old, &read_failed);
+	if (read_failed) {
+		return 0;
+	}
 	slot = best < 0 ? 0 : (best + 1) % SLOTS;
+	generation = old.generation;
+	other_ok = best < 0 ? 0 : read_head(slot, &other);
+	if (other_ok < 0) {
+		return 0;
+	}
+	if (other_ok > 0 && !pass(&old, 0)) {
+		if (!pass(&other, 0)) {
+			printf("var_store: neither existing archive could be verified; both slots are left intact\n");
+			return 0;
+		}
+		/* Overwrite the damaged archive and keep the verified fallback. */
+		slot = best;
+		best = (int)other.slot;
+		old = other;
+	}
 	printf("var_store: saving into slot %d (slot %d holds generation %llu)\n", slot, best,
-	    best < 0 ? 0ULL : (unsigned long long)old.generation);
+	    (unsigned long long)old.generation);
 
 	/* the slot's header first, so that a save cut short cannot leave an old header over a new archive */
 	memset(block, 0, sizeof(block));
@@ -835,7 +924,7 @@ save(void)
 	}
 	stream_start(slot, 0);
 	entries = 0;
-	last_saved_at = best < 0 ? 0 : old.seconds;
+	last_saved_at = old.seconds;
 	changed_entries = changed_bytes = 0;
 	skipped_blocks = written_blocks = 0;
 	arena_used = names_used = unsorted_dirs = 0;
@@ -850,7 +939,7 @@ save(void)
 	memcpy(h.magic, HEAD_MAGIC, sizeof(h.magic));
 	h.version = HEAD_VERSION;
 	h.slot = (uint32_t)slot;
-	h.generation = (best < 0 ? 0 : old.generation) + 1;
+	h.generation = generation + 1;
 	h.bytes = stream_bytes;
 	h.entries = entries;
 	{
@@ -903,11 +992,14 @@ static uint64_t retry_ms_left = RETRY_MS;
 static int
 whole_path(const char *relative, uint32_t len)
 {
-	if (len == 0 || len >= MAX_PATH - sizeof(ROOT) - 1 || relative[0] == '/') {
+	if (len == 0 || len >= MAX_PATH - sizeof(ROOT) || relative[0] == '/') {
 		return 0;
 	}
-	for (uint32_t i = 0; i + 1 < len; i++) {
-		if (relative[i] == '.' && relative[i + 1] == '.' &&
+	for (uint32_t i = 0; i < len; i++) {
+		if (relative[i] == '\0') {
+			return 0;
+		}
+		if (i + 1 < len && relative[i] == '.' && relative[i + 1] == '.' &&
 		    (i == 0 || relative[i - 1] == '/') && (i + 2 == len || relative[i + 2] == '/')) {
 			return 0;       /* nothing of this archive is unpacked outside ROOT */
 		}
@@ -930,6 +1022,23 @@ set_times(const struct entry *e)
 	utimes(path, times);
 }
 
+static void
+restore_link_xattrs(uint64_t used, char *name)
+{
+	for (uint64_t offset = 0; offset < used;) {
+		uint32_t namelen, vlen;
+
+		memcpy(&namelen, xpack + offset, sizeof(namelen));
+		memcpy(&vlen, xpack + offset + 4, sizeof(vlen));
+		offset += 8;
+		memcpy(name, xpack + offset, namelen);
+		name[namelen] = 0;
+		offset += namelen;
+		setxattr(path, name, xpack + offset, vlen, 0, XATTR_NOFOLLOW);
+		offset += vlen;
+	}
+}
+
 /*
  * One entry out of the archive and into /private/var. make: with 0, the entry is only read past
  * (the first pass, which proves the archive's checksum before anything is made).
@@ -941,6 +1050,7 @@ unpack_one(int make)
 	static char relative[MAX_PATH];
 	static uint8_t value[MAX_XATTR];
 	static char name[1024];
+	uint64_t link_xattrs = 0;
 	int out_fd = -1, ok = 1;
 
 	if (!in(&e, sizeof(e))) {
@@ -985,9 +1095,14 @@ unpack_one(int make)
 			ok = 0;
 			break;
 		}
-		if (namelen >= sizeof(name) || vlen > sizeof(value)) {
-			ok = in_skip(namelen) && in_skip(vlen);
-			skipped_big++;
+		if (!make || namelen >= sizeof(name) || vlen > sizeof(value)) {
+			if (!in_skip((uint64_t)namelen + vlen)) {
+				ok = 0;
+				break;
+			}
+			if (make) {
+				skipped_big++;
+			}
 			continue;
 		}
 		if (!in(name, namelen) || !in(value, vlen)) {
@@ -995,7 +1110,11 @@ unpack_one(int make)
 			break;
 		}
 		name[namelen] = 0;
-		if (make && e.kind != ENT_HARDLINK) {
+		if (e.kind == ENT_SYMLINK) {
+			if (!buffer_xattr(&link_xattrs, name, namelen, value, vlen)) {
+				skipped_big++;
+			}
+		} else if (e.kind != ENT_HARDLINK) {
 			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
 		}
 	}
@@ -1004,6 +1123,9 @@ unpack_one(int make)
 			close(out_fd);
 		}
 		return 0;
+	}
+	if (!make && (e.kind == ENT_FILE || e.kind == ENT_SYMLINK || e.kind == ENT_HARDLINK)) {
+		return in_skip(e.size) && in_pad();
 	}
 	/* the contents */
 	if (e.kind == ENT_FILE) {
@@ -1063,6 +1185,7 @@ unpack_one(int make)
 				/* a name the skeleton made too comes out as the store has it */
 				unlink(path);
 				if (symlink(target, path) == 0) {
+					restore_link_xattrs(link_xattrs, name);
 					made_links++;
 				}
 			} else if (make) {
@@ -1151,11 +1274,14 @@ static int
 load(void)
 {
 	struct head h;
-	int best;
+	int best, read_failed = 0;
 
 	memset(&h, 0, sizeof(h));
-	best = newest(&h);
+	best = newest(&h, &read_failed);
 	if (best < 0) {
+		if (read_failed) {
+			return 0;
+		}
 		printf("var_store: no store yet: /private/var stays as init made it\n");
 		return 1;
 	}
@@ -1169,7 +1295,7 @@ load(void)
 
 		/* the newest is torn: the one before it, which a save never touches, may still be whole */
 		for (int slot = 0; slot < SLOTS; slot++) {
-			if (slot != best && read_head(slot, &other) && pass(&other, 0)) {
+			if (slot != best && read_head(slot, &other) > 0 && pass(&other, 0)) {
 				left = slot;
 				break;
 			}
@@ -1196,14 +1322,17 @@ load(void)
 	return 1;
 }
 
-static void
+static int
 show(void)
 {
+	int ok = 1;
+
 	for (int slot = 0; slot < SLOTS; slot++) {
 		static uint8_t block[BLOCK];
 		struct head *h = (struct head *)block;
 
 		if (!device_read(slot_at(slot), block, BLOCK)) {
+			ok = 0;
 			continue;
 		}
 		if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0) {
@@ -1215,6 +1344,7 @@ show(void)
 		    (unsigned long long)h->entries, (unsigned long long)h->bytes, h->crc,
 		    (unsigned long long)h->seconds, h->head_crc == head_checksum(h) ? "right" : "WRONG");
 	}
+	return ok;
 }
 
 static int
@@ -1254,8 +1384,11 @@ save_once(void)
 		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
 		return 0;
 	}
-	ok = claim() && save();
-	release();
+	ok = 0;
+	if (claim()) {
+		ok = save();
+		release();
+	}
 	close(fd);
 	fd = -1;
 	return ok;
@@ -1383,23 +1516,25 @@ main(int argc, char **argv, char **envp)
 		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
 	}
+	if (strcmp(what, "save") == 0) {
+		return save_once() ? 0 : 1;
+	}
 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
 	if (fd < 0) {
 		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
 		    strerror(errno));
 		return 1;
 	}
-	if (strcmp(what, "save") == 0) {
-		ok = claim() && save();
-		release();
-	} else if (strcmp(what, "load") == 0) {
+	if (strcmp(what, "load") == 0) {
 		ok = load();
 	} else if (strcmp(what, "erase") == 0) {
-		ok = claim() && erase();        /* a write like any other: the claim first */
-		release();
+		ok = 0;
+		if (claim()) {
+			ok = erase();
+			release();
+		}
 	} else {
-		show();
-		ok = 1;
+		ok = show();
 	}
 	close(fd);
 	return ok ? 0 : 1;

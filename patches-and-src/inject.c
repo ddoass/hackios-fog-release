@@ -66,6 +66,9 @@ say(const char *format, ...)
 	va_start(ap, format);
 	n = vsnprintf(line, sizeof(line), format, ap);
 	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}

@@ -1,18 +1,12 @@
 #!/bin/bash
-# HackiOS for Xiaomi Redmi 10C (fog) -- run the prebuilt SpringBoard payload, RAM only.
-#
-#   ./run.sh                 the whole cycle and SECS (default 2400) seconds of the kernel running
-#   SECS=600 ./run.sh        a shorter run
-#   SLICE=60 ./run.sh        fetch the log every 60 s instead of 120
-#
-# Nothing is written to the phone: the UEFI, the kernel, the payload and the root image are all
-# uploaded/staged into RAM. The loader dies on a second kernel in the same session, so every run is
-# a full cycle: bootloader -> UEFI -> [xnuloader] -> resident ramdisk -> stage payload -> oem run.
-set -u
-ROOT=$(cd "$(dirname "$0")" && pwd)
-cd "$ROOT"
+# Run the prebuilt SpringBoard payload on the Xiaomi Redmi 10C (fog).
+# SECS sets how long to collect logs; the prebuilt kernel's timer is fixed at 2400 s.
+# SLICE controls how often to collect a log. The resident image is uploaded into RAM.
+set -uo pipefail
 
-K=$ROOT/prebuilt/mach.development.bcm2837
+ROOT=$(cd -- "$(dirname -- "$0")" && pwd) || exit 1
+cd -- "$ROOT" || exit 1
+
 UEFI=$ROOT/prebuilt/xnu-usb-fog.img
 PAYLOAD=$ROOT/prebuilt/run-sb-unblock.bin
 FLASHBOOT=$ROOT/prebuilt/flashboot.apfs
@@ -21,66 +15,116 @@ XL=$ROOT/prebuilt/xl
 SECS=${SECS:-2400}
 SLICE=${SLICE:-120}
 OUT=${OUT:-$ROOT/logs/run-sb-unblock.log}
-mkdir -p "$ROOT/logs"
+PHONE=${XDG_RUNTIME_DIR:-/tmp}/darwin-hakios-phone
 
-say() { echo "[$(date +%T)] $*"; }
+say() { printf '[%s] %s\n' "$(date +%T)" "$*"; }
+fail() { say "$*" >&2; exit 1; }
 
-waitfor() { # waitfor <what> <command...>
-	local what=$1 i
-	shift
-	for i in $(seq 1 60); do
-		if "$@" >/dev/null 2>&1; then return 0; fi
+for value in "$SECS" "$SLICE"; do
+	[[ $value =~ ^[0-9]{1,9}$ ]] && ((10#$value > 0)) ||
+		fail "SECS and SLICE must be positive integer seconds (up to 9 digits)"
+done
+SECS=$((10#$SECS))
+SLICE=$((10#$SLICE))
+
+for file in "$UEFI" "$PAYLOAD" "$FLASHBOOT"; do
+	[[ -s $file && -r $file ]] || fail "missing, empty or unreadable image: $file"
+done
+[[ -x $XL ]] || fail "missing or non-executable helper: $XL"
+
+for command in fastboot flock timeout python3; do
+	command -v "$command" >/dev/null || fail "required command not found: $command"
+done
+mkdir -p -- "$ROOT/logs" || fail "cannot create $ROOT/logs"
+[[ ! -d $OUT ]] || fail "OUT is a directory: $OUT"
+snapshot_dir=$(mktemp -d -- "$OUT.tmp.XXXXXX") || fail "cannot create a temporary directory for $OUT"
+snapshot=$snapshot_dir/kernel.log
+trap 'rm -f -- "$snapshot"; rmdir -- "$snapshot_dir"' EXIT
+
+exec 9>"$PHONE.launch" || fail "cannot open the launcher lock"
+flock -n 9 || fail "another launch is in progress"
+
+read_state() {
+	local output
+	output=$("$XL" state --serial) || fail "could not identify a single Fastboot device"
+	read -r state serial product <<< "$output"
+}
+
+wait_for_stock() {
+	local deadline=$((SECONDS + 240)) adb_state
+	local rebooted=0
+	while ((SECONDS < deadline)); do
+		read_state
+		[[ $state == fastboot ]] && return 0
+		if [[ $state == absent ]] && ((rebooted == 0)) && command -v adb >/dev/null; then
+			adb_state=$(timeout 5 adb -d get-state 9>&- 2>/dev/null) || adb_state=
+			case "$adb_state" in
+				device|recovery)
+					say "requesting the bootloader over ADB"
+					timeout 20 adb -d reboot bootloader 9>&- || fail "ADB reboot to bootloader failed"
+					rebooted=1
+					;;
+			esac
+		fi
 		sleep 2
 	done
-	say "no $what after 120 s"
 	return 1
 }
 
-for f in "$K" "$UEFI" "$PAYLOAD" "$FLASHBOOT" "$XL"; do
-	[ -f "$f" ] || { say "missing $f"; exit 1; }
-done
-
-say "rebooting to the bootloader"
-if fastboot devices | grep -q xnuloader; then
-	say "leaving the loader"
-	fastboot reboot | tail -1
+read_state
+if [[ $state == loader ]]; then
+	say "leaving the previous loader session"
+	flock -w 30 "$PHONE.lock" timeout 20 fastboot -s "$serial" reboot || fail "loader reboot failed"
 fi
-if ! fastboot devices | grep -q fastboot; then
-	# Android or its recovery: both have adb (the loader's reboot has landed in recovery before)
-	timeout 240 adb wait-for-device || true
-	sleep 4
-	adb reboot bootloader 2>/dev/null || adb reboot 2>/dev/null || true
-	sleep 12
+if [[ $state != fastboot ]]; then
+	say "waiting for the phone's bootloader"
+	wait_for_stock || fail "the phone did not reach Fastboot"
 fi
-if ! fastboot devices | grep -q fastboot; then
-	say "no fastboot device"
-	exit 1
-fi
+[[ $product == fog ]] || fail "expected stock Fastboot product fog, got ${product:-unknown}"
 
 say "booting the UEFI"
-fastboot boot "$UEFI" | tail -2
-sleep 10
-waitfor xnuloader sh -c 'fastboot devices | grep -q xnuloader' || exit 1
+flock -w 30 "$PHONE.lock" timeout 45 fastboot -s "$serial" boot "$UEFI" ||
+	fail "UEFI boot failed"
+
+deadline=$((SECONDS + 120))
+while :; do
+	read_state
+	[[ $state == loader ]] && break
+	((SECONDS < deadline)) || fail "xnuloader did not appear within 120 s"
+	sleep 2
+done
 
 say "uploading the resident image"
-"$XL" ramdisk "$FLASHBOOT" | tail -2 || exit 1
+XL_FASTBOOT_SERIAL=$serial "$XL" ramdisk "$FLASHBOOT" || fail "resident image upload failed"
 
-say "staging the payload"
-fastboot stage "$PAYLOAD" | tail -2 || exit 1
+say "staging and starting the payload"
+(
+	flock -w 30 8 || exit 1
+	timeout 120 fastboot -s "$serial" stage "$PAYLOAD" || exit 1
+	timeout 30 fastboot -s "$serial" oem run
+) 8>"$PHONE.lock" || fail "payload launch failed"
 
-say "running ($SECS s)"
-fastboot oem run | tail -2
-
+say "collecting logs for $SECS s"
+started=$SECONDS
 i=0
-while [ $((i * SLICE)) -lt "$SECS" ]; do
+saved=0
+while ((SECONDS - started < SECS)); do
+	remaining=$((SECS - (SECONDS - started)))
+	delay=$SLICE
+	((delay <= remaining)) || delay=$remaining
+	sleep "$delay" || fail "log collection interrupted"
 	i=$((i + 1))
-	sleep "$SLICE"
-	"$XL" log >/dev/null 2>&1 || true
-	# the kernel log starts after the loader's own log
-	sed -n '/== KERNEL LOG/,$p' "$ROOT/logs/loader.log" > "$OUT"
-	say "slice $i: $(wc -c <"$OUT") bytes, $(grep -ac 'hakios: threads' "$OUT") thread dumps, last line: $(tail -1 "$OUT" | cut -c1-60)"
-	if [ $((i % 2)) = 0 ]; then
-		"$XL" screenshot "$ROOT/logs/screen-$((i * SLICE)).png" >/dev/null 2>&1 || true
+	if XL_FASTBOOT_SERIAL=$serial "$XL" log | sed -n '/== KERNEL LOG/,$p' > "$snapshot" && [[ -s $snapshot ]]; then
+		mv -fT -- "$snapshot" "$OUT" || fail "cannot update $OUT"
+		saved=1
+		say "slice $i: $(wc -c < "$OUT") bytes, $(grep -ac 'hakios: threads' "$OUT") thread dumps, last line: $(tail -n 1 "$OUT" | cut -c1-60)"
+	else
+		say "slice $i: no kernel log received" >&2
+	fi
+	if ((i % 2 == 0)); then
+		XL_FASTBOOT_SERIAL=$serial "$XL" screenshot "$ROOT/logs/screen-$((SECONDS - started)).png" ||
+			say "slice $i: screenshot failed" >&2
 	fi
 done
-say "done; the slice is $OUT"
+((saved)) || fail "no kernel log collected during this run"
+say "kernel log saved to $OUT"

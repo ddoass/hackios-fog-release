@@ -425,10 +425,20 @@ index 6801ce2..738f8a8 100644
  	printf("\n=== %d checks, %d failed ===\n", checks, failures);
  	/* daemons that do not run as root get the console as their standard error too */
 diff --git a/userland/src/inject.c b/userland/src/inject.c
-index 1a125f2..7c539a6 100644
+index 1a125f27ef2dbf9abf55a36210195525dd760347..9f63158d561d44bc267a5769562ddb96f7abf413 100644
 --- a/userland/src/inject.c
 +++ b/userland/src/inject.c
-@@ -579,6 +579,246 @@ brightness_fixes(void)
+@@ -66,6 +66,9 @@ say(const char *format, ...)
+ 	va_start(ap, format);
+ 	n = vsnprintf(line, sizeof(line), format, ap);
+ 	va_end(ap);
++	if (n <= 0) {
++		return;
++	}
+ 	if (n > (int)sizeof(line) - 1) {
+ 		n = sizeof(line) - 1;
+ 	}
+@@ -579,6 +582,246 @@ brightness_fixes(void)
  	method_setImplementation(method, (IMP)wait_for_als_arrival);
  }
  
@@ -675,7 +685,7 @@ index 1a125f2..7c539a6 100644
  /* ---- backboardd: the touch screen and the buttons ---------------------------------------------- */
  
  /* IOKit's HID event system, the part that has no public header on Darwin (prototypes checked against 20F66) */
-@@ -899,6 +1139,9 @@ micros(uint64_t absolute)
+@@ -899,6 +1142,9 @@ micros(uint64_t absolute)
  	return absolute * timebase.numer / timebase.denom / 1000;
  }
  
@@ -685,7 +695,7 @@ index 1a125f2..7c539a6 100644
  static void *
  input_thread(__unused void *arg)
  {
-@@ -920,6 +1163,11 @@ input_thread(__unused void *arg)
+@@ -920,6 +1166,11 @@ input_thread(__unused void *arg)
  		mach_timebase_info(&timebase);
  	}
  	device = open(HAKIOS_TOUCH_DEVICE, O_RDONLY);
@@ -697,7 +707,7 @@ index 1a125f2..7c539a6 100644
  	if (device < 0) {
  		say("hakios: input: %s: %s\n", HAKIOS_TOUCH_DEVICE, strerror(errno));
  		return NULL;
-@@ -1126,6 +1374,8 @@ hakios_init(void)
+@@ -1126,6 +1377,8 @@ hakios_init(void)
  		}
  		opengl_es();
  		window_server_fixes();
@@ -707,20 +717,30 @@ index 1a125f2..7c539a6 100644
  		 * brightness_fixes() is not used for now: with it backboardd no longer took our touch
  		 * screen service for its own ("still waiting for a main screen digitizer"), whether the
 diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
-index f93446d..09d7c8c 100644
+index f93446dc88e0e6c71e9f67176e96371b9f22c0d4..c9cf3604bfa9162444aad47ed62e6213d03729f7 100644
 --- a/userland/src/inject_sb.c
 +++ b/userland/src/inject_sb.c
-@@ -37,7 +37,9 @@
+@@ -37,7 +37,10 @@
  #include <dispatch/dispatch.h>
  #include <dlfcn.h>
  #include <fcntl.h>
++#include <limits.h>
 +#include <mach/mach.h>
  #include <mach/mach_time.h>
 +#include <pthread.h>
  #include <notify.h>
  #include <objc/message.h>
  #include <objc/runtime.h>
-@@ -69,6 +71,380 @@ say(const char *format, ...)
+@@ -63,12 +66,389 @@ say(const char *format, ...)
+ 	va_start(ap, format);
+ 	n = vsnprintf(line, sizeof(line), format, ap);
+ 	va_end(ap);
++	if (n <= 0) {
++		return;
++	}
+ 	if (n > (int)sizeof(line) - 1) {
+ 		n = sizeof(line) - 1;
+ 	}
  	write(say_fd, line, (size_t)n);
  }
  
@@ -1101,7 +1121,7 @@ index f93446d..09d7c8c 100644
  /*
   * Boot-arg touch_lat=1: a line for every turn of SpringBoard's main run loop -- when it woke up (a
   * touch, a timer, the display link ...), when CoreAnimation's commit of what that turn changed
-@@ -87,6 +463,160 @@ now_us(void)
+@@ -87,6 +467,170 @@ now_us(void)
  	return mach_absolute_time() * timebase.numer / timebase.denom / 1000;
  }
  
@@ -1216,11 +1236,11 @@ index f93446d..09d7c8c 100644
 +static void *
 +threads_watchdog(void *argument)
 +{
-+	double seconds = *(double *)argument;
++	unsigned seconds = *(unsigned *)argument;
 +
 +	free(argument);
 +	for (;;) {
-+		sleep((unsigned)seconds);
++		sleep(seconds);
 +		say_all_threads();
 +	}
 +	return NULL;
@@ -1230,39 +1250,206 @@ index f93446d..09d7c8c 100644
 +watch_threads(const char *arguments)
 +{
 +	const char *setting = strstr(arguments, "sb_threads=");
++	CFRunLoopObserverRef observer;
 +	pthread_t thread;
-+	double *seconds;
++	char *end;
++	double interval;
++	unsigned *seconds, period;
 +
 +	if (setting == NULL || (setting != arguments && setting[-1] != ' ')) {
 +		return;
 +	}
++	setting += 11;
++	interval = strtod(setting, &end);
++	if (end == setting || (*end != 0 && *end != ' ') || !(interval > 0 && interval <= UINT_MAX)) {
++		return;
++	}
++	period = interval < 1 ? 1 : (unsigned)interval;
 +	if ((seconds = malloc(sizeof(*seconds))) == NULL) {
 +		return;
 +	}
-+	*seconds = atof(setting + 11);
-+	if (*seconds <= 0) {
-+		free(seconds);
-+		return;
-+	}
++	*seconds = period;
 +	if (timebase.denom == 0) {
 +		mach_timebase_info(&timebase);
 +	}
 +	sb_main_thread = mach_thread_self();    /* this constructor runs on the main thread */
-+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, 0,
-+	    main_woke_note, NULL), kCFRunLoopCommonModes);
 +	if (pthread_create(&thread, NULL, threads_watchdog, seconds) != 0) {
++		mach_port_deallocate(mach_task_self(), sb_main_thread);
++		sb_main_thread = MACH_PORT_NULL;
 +		free(seconds);
 +		say("hakios: threads: no watchdog\n");
 +		return;
 +	}
 +	pthread_detach(thread);
-+	say("hakios: threads: a stack of every thread every %.0f s\n", *seconds);
++	observer = CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, 0, main_woke_note, NULL);
++	if (observer != NULL) {
++		CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
++		CFRelease(observer);
++	}
++	say("hakios: threads: a stack of every thread every %u s\n", period);
 +}
 +
  static void
  main_loop_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
  {
-@@ -1246,6 +1776,322 @@ load_tweaks(void)
+@@ -861,21 +1405,40 @@ switcher_wallpaper_overlay(id self, SEL selector)
+ 	}
+ }
+ 
++static size_t __attribute__((format(printf, 4, 5)))
++append_layer_text(char *buffer, size_t size, size_t used, const char *format, ...)
++{
++	va_list ap;
++	int written;
++
++	if (size == 0 || used >= size - 1) {
++		return used;
++	}
++	va_start(ap, format);
++	written = vsnprintf(buffer + used, size - used, format, ap);
++	va_end(ap);
++	if (written < 0) {
++		buffer[used] = '\0';
++		return used;
++	}
++	return (size_t)written >= size - used ? size - 1 : used + (size_t)written;
++}
++
+ static void
+ layer_filter(id filter, const char *what, int depth)
+ {
+ 	static const char *const inputs[] = { "inputColorMatrix", "inputRadius", "inputAmount", "inputColor", "inputAngle",
+ 		                              "inputPremultipliedValues", "inputNormalizeEdges", "inputReversed" };
+-	char line[1024];
++	char line[1024] = "";
+ 	size_t n;
+ 
+ 	if (!class_respondsToSelector(object_getClass(filter), sel_registerName("type"))) {
+ 		say("hakios: layers%s: %*s  %s %s\n", layers_of, 2 * depth, "", what, text_of(filter));     /* a name alone */
+ 		return;
+ 	}
+-	n = (size_t)snprintf(line, sizeof(line), "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
++	n = append_layer_text(line, sizeof(line), 0, "%s %s \"%s\"%s", what, text_of(SEND(id, filter, "type")),
+ 	    text_of(SEND(id, filter, "name")), SEND(BOOL, filter, "isEnabled") ? "" : " (disabled)");
+-	for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]) && n < sizeof(line); i++) {
++	for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]) && n < sizeof(line) - 1; i++) {
+ 		id key = SEND1(id, objc_getClass("NSString"), "stringWithUTF8String:", const char *, inputs[i]);
+ 		id value = SEND1(id, filter, "valueForKey:", id, key);
+ 		float m[20];
+@@ -885,11 +1448,11 @@ layer_filter(id filter, const char *what, int depth)
+ 		}
+ 		if (i == 0 && class_respondsToSelector(object_getClass(value), sel_registerName("CAColorMatrixValue"))) {
+ 			SEND1(void, value, "getValue:", void *, m);
+-			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s [%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g | "
++			n = append_layer_text(line, sizeof(line), n, " %s [%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g | "
+ 			    "%.3g %.3g %.3g %.3g %.3g | %.3g %.3g %.3g %.3g %.3g]", inputs[i], m[0], m[1], m[2], m[3], m[4], m[5], m[6],
+ 			    m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18], m[19]);
+ 		} else {
+-			n += (size_t)snprintf(line + n, sizeof(line) - n, " %s %s", inputs[i], text_of(value));
++			n = append_layer_text(line, sizeof(line), n, " %s %s", inputs[i], text_of(value));
+ 		}
+ 	}
+ 	say("hakios: layers%s: %*s  %s\n", layers_of, 2 * depth, "", line);
+@@ -908,7 +1471,7 @@ layer_line(id layer, const char *role, int depth)
+ 	size_t n = 0;
+ 
+ 	if (SEND(BOOL, layer, "isHidden")) {
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " HIDDEN");
++		n = append_layer_text(more, sizeof(more), n, " HIDDEN");
+ 	}
+ 	if (contents != NULL) {
+ 		id text = (id)CFCopyDescription((CFTypeRef)contents);
+@@ -933,7 +1496,7 @@ layer_line(id layer, const char *role, int depth)
+ 			flat[k++] = *from++;
+ 		}
+ 		flat[k] = 0;
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " contents %s", flat);
++		n = append_layer_text(more, sizeof(more), n, " contents %s", flat);
+ 		CFRelease((CFTypeRef)text);
+ 	}
+ 	if (contents != NULL && class_respondsToSelector(object_getClass(layer), sel_registerName("contentsMultiplyColor")) &&
+@@ -941,33 +1504,33 @@ layer_line(id layer, const char *role, int depth)
+ 		id text = (id)CFCopyDescription(SEND(void *, layer, "contentsMultiplyColor"));
+ 		const char *numbers = strstr(text_of(text), "( ");
+ 
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " times %.40s", numbers ? numbers : "?");
++		n = append_layer_text(more, sizeof(more), n, " times %.40s", numbers ? numbers : "?");
+ 		CFRelease((CFTypeRef)text);
+ 	}
+ 	if (colour != NULL) {
+ 		id text = (id)CFCopyDescription(colour);
+ 		const char *numbers = strstr(text_of(text), "( ");
+ 
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " colour %.40s", numbers ? numbers : "?");
++		n = append_layer_text(more, sizeof(more), n, " colour %.40s", numbers ? numbers : "?");
+ 		CFRelease((CFTypeRef)text);
+ 	}
+ 	if (strcmp(class_name, "CAPortalLayer") == 0) {
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " PORTAL of %p%s%s", (void *)SEND(id, layer, "sourceLayer"),
++		n = append_layer_text(more, sizeof(more), n, " PORTAL of %p%s%s", (void *)SEND(id, layer, "sourceLayer"),
+ 		    SEND(BOOL, layer, "hidesSourceLayer") ? " (hides it)" : "", SEND(BOOL, layer, "matchesOpacity") ? " (its opacity)" : "");
+ 	} else if (strcmp(class_name, "CABackdropLayer") == 0) {
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " BACKDROP group \"%s\" scale %g%s", text_of(SEND(id, layer, "groupName")),
++		n = append_layer_text(more, sizeof(more), n, " BACKDROP group \"%s\" scale %g%s", text_of(SEND(id, layer, "groupName")),
+ 		    SEND(double, layer, "scale"), SEND(BOOL, layer, "captureOnly") ? " (capture only)" : "");
+ 	} else if (strcmp(class_name, "CAGradientLayer") == 0) {
+ 		struct { double x, y; } from = SEND(typeof(from), layer, "startPoint"), to = SEND(typeof(to), layer, "endPoint");
+ 		id colours = SEND(id, layer, "colors");
+ 
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " GRADIENT %s from %g,%g to %g,%g at %.40s:", text_of(SEND(id, layer, "type")),
++		n = append_layer_text(more, sizeof(more), n, " GRADIENT %s from %g,%g to %g,%g at %.40s:", text_of(SEND(id, layer, "type")),
+ 		    from.x, from.y, to.x, to.y, text_of(SEND(id, layer, "locations")));
+-		for (long i = 0; colours != NULL && i < SEND(long, colours, "count") && n < sizeof(more); i++) {
++		for (long i = 0; colours != NULL && i < SEND(long, colours, "count") && n < sizeof(more) - 1; i++) {
+ 			id text = (id)CFCopyDescription((CFTypeRef)SEND1(id, colours, "objectAtIndex:", long, i));
+ 			const char *numbers = strstr(text_of(text), "( ");
+ 
+-			n += (size_t)snprintf(more + n, sizeof(more) - n, " %.30s", numbers ? numbers : "?");
++			n = append_layer_text(more, sizeof(more), n, " %.30s", numbers ? numbers : "?");
+ 			CFRelease((CFTypeRef)text);
+ 		}
+ 	} else if (strcmp(class_name, "CAShapeLayer") == 0) {
+@@ -975,7 +1538,7 @@ layer_line(id layer, const char *role, int depth)
+ 		id text_stroke = stroke ? (id)CFCopyDescription(stroke) : NULL, text_fill = fill ? (id)CFCopyDescription(fill) : NULL;
+ 		const char *ns = text_stroke ? strstr(text_of(text_stroke), "( ") : NULL, *nf = text_fill ? strstr(text_of(text_fill), "( ") : NULL;
+ 
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " SHAPE line %g stroke %.30s fill %.30s ends %g-%g", SEND(double, layer,
++		n = append_layer_text(more, sizeof(more), n, " SHAPE line %g stroke %.30s fill %.30s ends %g-%g", SEND(double, layer,
+ 		    "lineWidth"), ns ? ns : "-", nf ? nf : "-", SEND(double, layer, "strokeStart"), SEND(double, layer, "strokeEnd"));
+ 		if (text_stroke != NULL) {
+ 			CFRelease((CFTypeRef)text_stroke);
+@@ -984,7 +1547,7 @@ layer_line(id layer, const char *role, int depth)
+ 			CFRelease((CFTypeRef)text_fill);
+ 		}
+ 	} else if (strcmp(class_name, "CALayerHost") == 0) {
+-		n += (size_t)snprintf(more + n, sizeof(more) - n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
++		n = append_layer_text(more, sizeof(more), n, " HOST of context %#x%s%s", SEND(unsigned, layer, "contextId"),
+ 		    SEND(BOOL, layer, "inheritsSecurity") ? " (inherits security)" : "",
+ 		    SEND(BOOL, layer, "rendersAsynchronously") ? " (asynchronously)" : "");
+ 	}
+@@ -994,17 +1557,17 @@ layer_line(id layer, const char *role, int depth)
+ 		id delegate = SEND(id, layer, "delegate");
+ 
+ 		if (delegate != NULL) {
+-			n += (size_t)snprintf(more + n, sizeof(more) - n, " of %s", object_getClassName(delegate));
++			n = append_layer_text(more, sizeof(more), n, " of %s", object_getClassName(delegate));
+ 		}
+ 	}
+ 	{
+ 		id keys = SEND(id, layer, "animationKeys");
+ 
+ 		if (SEND(BOOL, layer, "shouldRasterize")) {
+-			n += (size_t)snprintf(more + n, sizeof(more) - n, " RASTERIZED");
++			n = append_layer_text(more, sizeof(more), n, " RASTERIZED");
+ 		}
+-		for (long i = 0; keys != NULL && i < SEND(long, keys, "count") && n < sizeof(more); i++) {
+-			n += (size_t)snprintf(more + n, sizeof(more) - n, "%s%s", i == 0 ? " ANIMATIONS " : ",",
++		for (long i = 0; keys != NULL && i < SEND(long, keys, "count") && n < sizeof(more) - 1; i++) {
++			n = append_layer_text(more, sizeof(more), n, "%s%s", i == 0 ? " ANIMATIONS " : ",",
+ 			    text_of(SEND1(id, keys, "objectAtIndex:", long, i)));
+ 		}
+ 	}
+@@ -1246,6 +1809,323 @@ load_tweaks(void)
  	}
  }
  
@@ -1546,6 +1733,7 @@ index f93446d..09d7c8c 100644
 +{
 +	const char *name = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("name")));
 +	const char *reason = sb_text(((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("reason")));
++	size_t reason_length = reason != NULL ? strlen(reason) : 0;
 +	id addresses;
 +	unsigned long frames, frame;
 +
@@ -1555,7 +1743,7 @@ index f93446d..09d7c8c 100644
 +	 * callStackSymbols here).
 +	 */
 +	say("hakios: EXC %s\n", name);
-+	for (size_t at = 0; reason != NULL && reason[at] != 0; at += 60) {
++	for (size_t at = 0; at < reason_length; at += 60) {
 +		say("hakios: EXC %.*s\n", 60, reason + at);
 +	}
 +	addresses = ((id (*)(id, SEL))objc_msgSend)(exception, sel_registerName("callStackReturnAddresses"));
@@ -1585,7 +1773,7 @@ index f93446d..09d7c8c 100644
  __attribute__((constructor))
  static void
  hakios_springboard_init(void)
-@@ -1280,6 +2126,11 @@ hakios_springboard_init(void)
+@@ -1280,6 +2160,11 @@ hakios_springboard_init(void)
  	 * this one opens it, the way a jailbreak's own hook does.
  	 */
  	load_tweaks();
@@ -1597,7 +1785,7 @@ index f93446d..09d7c8c 100644
  	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
  	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
  	original_set_setup_required_reason = (void (*)(id, SEL, long))replace_method("SBSetupManager",
-@@ -1365,9 +2216,12 @@ hakios_springboard_init(void)
+@@ -1365,9 +2250,12 @@ hakios_springboard_init(void)
  		size_t size = sizeof(args) - 1;
  		const char *delay;
  
@@ -1614,7 +1802,7 @@ index f93446d..09d7c8c 100644
  	}
  	/*
 diff --git a/userland/src/var_store.c b/userland/src/var_store.c
-index 84f246b..b2e0cd3 100644
+index 84f246b49ffb298d2dc2d4e4e6f13f0c334b412c..604d4a16b8e58170c2adc76f3092bb5530f896e4 100644
 --- a/userland/src/var_store.c
 +++ b/userland/src/var_store.c
 @@ -19,7 +19,7 @@
@@ -1635,7 +1823,15 @@ index 84f246b..b2e0cd3 100644
   * slot being written is never the one holding the newest good archive, and a header is written
   * last and over a zeroed one -- so the worst an interrupted or doubled save can do is lose itself.
   *
-@@ -168,7 +168,7 @@ sysctl_set_int(const char *name, int value)
+@@ -59,6 +59,7 @@
+ #define XPACK           (512u << 10)            /* all the attributes of one file, packed */
+ #define LINKS           8192                    /* names remembered for hard links */
+ #define LINK_PATH       256
++#define DARWIN_EINTR    4                       /* mini.h exposes errno, but not its constants */
+ /*
+  * The file flags put back: the ones a tree of files can mean. UF_COMPRESSED is not among them
+  * (a ramfs file is not a compressed HFS one, and the flag would make it read as empty), nor are
+@@ -168,7 +169,7 @@ sysctl_set_int(const char *name, int value)
  static int
  claim(void)
  {
@@ -1644,7 +1840,7 @@ index 84f246b..b2e0cd3 100644
  		printf("var_store: the store is claimed by another saver (%s)\n", strerror(errno));
  		return 0;
  	}
-@@ -178,7 +178,7 @@ claim(void)
+@@ -178,7 +179,7 @@ claim(void)
  static void
  release(void)
  {
@@ -1653,7 +1849,568 @@ index 84f246b..b2e0cd3 100644
  }
  
  /* ---- checksum (the same one the loader reads a write back with) ---- */
-@@ -1275,7 +1275,7 @@ watch(int seconds)
+@@ -247,9 +248,12 @@ device_write(off_t where, const void *data, uint64_t n)
+ 	while (n > 0) {
+ 		ssize_t wrote = pwrite(fd, p, (size_t)n, where);
+ 
++		if (wrote < 0 && errno == DARWIN_EINTR) {
++			continue;
++		}
+ 		if (wrote <= 0) {
+ 			printf("var_store: writing %llu bytes at %lld: %s\n", (unsigned long long)n,
+-			    (long long)where, strerror(errno));
++			    (long long)where, wrote == 0 ? "no progress" : strerror(errno));
+ 			return 0;
+ 		}
+ 		p += wrote;
+@@ -267,9 +271,12 @@ device_read(off_t where, void *data, uint64_t n)
+ 	while (n > 0) {
+ 		ssize_t got = pread(fd, p, (size_t)n, where);
+ 
++		if (got < 0 && errno == DARWIN_EINTR) {
++			continue;
++		}
+ 		if (got <= 0) {
+ 			printf("var_store: reading %llu bytes at %lld: %s\n", (unsigned long long)n,
+-			    (long long)where, strerror(errno));
++			    (long long)where, got == 0 ? "unexpected end of device" : strerror(errno));
+ 			return 0;
+ 		}
+ 		p += got;
+@@ -402,17 +409,7 @@ in(void *data, uint64_t n)
+ static int
+ in_skip(uint64_t n)
+ {
+-	uint8_t waste[512];
+-
+-	while (n > 0) {
+-		uint64_t piece = n > sizeof(waste) ? sizeof(waste) : n;
+-
+-		if (!in(waste, piece)) {
+-			return 0;
+-		}
+-		n -= piece;
+-	}
+-	return 1;
++	return in(NULL, n);
+ }
+ 
+ static int
+@@ -436,7 +433,7 @@ stream_start(int slot, uint64_t bytes)
+ 
+ /* ---- the slots ---- */
+ 
+-/* The slot's header, if it is one of ours and says of itself what it should. */
++/* 1 for a valid header, 0 for an invalid header, -1 if the header could not be read. */
+ static int
+ read_head(int slot, struct head *into)
+ {
+@@ -444,7 +441,7 @@ read_head(int slot, struct head *into)
+ 	struct head *h = (struct head *)block;
+ 
+ 	if (!device_read(slot_at(slot), block, BLOCK)) {
+-		return 0;
++		return -1;
+ 	}
+ 	if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0 || h->version != HEAD_VERSION ||
+ 	    h->slot != (uint32_t)slot || h->bytes > (uint64_t)SLOT_BYTES - BLOCK ||
+@@ -457,14 +454,18 @@ read_head(int slot, struct head *into)
+ 
+ /* The newest slot whose header checks out, or -1. */
+ static int
+-newest(struct head *out_head)
++newest(struct head *out_head, int *read_failed)
+ {
+ 	int best = -1;
+ 
+ 	for (int slot = 0; slot < SLOTS; slot++) {
+ 		struct head h;
++		int ok = read_head(slot, &h);
+ 
+-		if (!read_head(slot, &h)) {
++		if (ok < 0) {
++			*read_failed = 1;
++		}
++		if (ok <= 0) {
+ 			continue;
+ 		}
+ 		if (best < 0 || h.generation > out_head->generation) {
+@@ -528,6 +529,20 @@ link_name(uint64_t ino, const char *relative)
+  */
+ static uint8_t xpack[XPACK];
+ 
++static int
++buffer_xattr(uint64_t *used, const char *name, uint32_t namelen, const void *value, uint32_t vlen)
++{
++	if (*used + 8 + namelen + vlen > XPACK) {
++		return 0;
++	}
++	memcpy(xpack + *used, &namelen, sizeof(namelen));
++	memcpy(xpack + *used + 4, &vlen, sizeof(vlen));
++	memcpy(xpack + *used + 8, name, namelen);
++	memcpy(xpack + *used + 8 + namelen, value, vlen);
++	*used += 8 + namelen + vlen;
++	return 1;
++}
++
+ static uint64_t
+ pack_xattrs(uint32_t *count)
+ {
+@@ -541,22 +556,16 @@ pack_xattrs(uint32_t *count)
+ 		return 0;
+ 	}
+ 	for (ssize_t i = 0; i < n && i < (ssize_t)sizeof(names); i += (ssize_t)strlen(names + i) + 1) {
+-		uint32_t namelen = (uint32_t)strlen(names + i), vlen;
++		uint32_t namelen = (uint32_t)strlen(names + i);
+ 		ssize_t size = getxattr(path, names + i, value, sizeof(value), 0, XATTR_NOFOLLOW);
+ 
+ 		if (size < 0) {
+ 			continue;
+ 		}
+-		vlen = (uint32_t)size;
+-		if (used + 8 + namelen + vlen > XPACK) {
++		if (!buffer_xattr(&used, names + i, namelen, value, (uint32_t)size)) {
+ 			skipped_big++;
+ 			continue;
+ 		}
+-		memcpy(xpack + used, &namelen, sizeof(namelen));
+-		memcpy(xpack + used + 4, &vlen, sizeof(vlen));
+-		memcpy(xpack + used + 8, names + i, namelen);
+-		memcpy(xpack + used + 8 + namelen, value, vlen);
+-		used += 8 + namelen + vlen;
+ 		(*count)++;
+ 	}
+ 	return used;
+@@ -584,6 +593,10 @@ pack_one(const char *relative, const struct stat *st)
+ 		if (n <= 0) {
+ 			return 1;
+ 		}
++		if ((size_t)n == sizeof(target)) {
++			printf("var_store: %s: link target is too long\n", path);
++			return 0;
++		}
+ 		kind = ENT_SYMLINK;
+ 		size = (uint64_t)n;
+ 		tail = target;
+@@ -592,19 +605,21 @@ pack_one(const char *relative, const struct stat *st)
+ 	case S_IFREG:
+ 		kind = ENT_FILE;
+ 		size = (uint64_t)st->st_size;
++		in_fd = open(path, O_RDONLY, 0);
++		if (in_fd < 0) {
++			return 1;       /* gone, or not ours to read: it is not in the archive */
++		}
+ 		if (st->st_nlink > 1) {
+ 			first = link_name(st->st_ino, relative);
+ 			if (first != NULL) {
++				close(in_fd);
++				in_fd = -1;
+ 				kind = ENT_HARDLINK;
+ 				size = strlen(first);
+ 				tail = first;
+ 				break;
+ 			}
+ 		}
+-		in_fd = open(path, O_RDONLY, 0);
+-		if (in_fd < 0) {
+-			return 1;       /* gone, or not ours to read: it is not in the archive */
+-		}
+ 		break;
+ 	default:
+ 		skipped_kinds++;        /* a socket, a fifo, a device: a new boot makes its own */
+@@ -649,7 +664,15 @@ pack_one(const char *relative, const struct stat *st)
+ 			uint64_t want = left > sizeof(piece) ? sizeof(piece) : left;
+ 			ssize_t got = read(in_fd, piece, (size_t)want);
+ 
+-			if (got <= 0) {
++			if (got < 0) {
++				if (errno == DARWIN_EINTR) {
++					continue;
++				}
++				printf("var_store: %s: %s\n", path, strerror(errno));
++				close(in_fd);
++				return 0;
++			}
++			if (got == 0) {
+ 				/* the file shrank under us: the rest is zeros, so the archive stays whole */
+ 				memset(piece, 0, (size_t)want);
+ 				got = (ssize_t)want;
+@@ -718,9 +741,9 @@ sort_names(uint32_t *at, uint64_t n)
+ 	}
+ }
+ 
+-/* Every name in the open directory into the arena, sorted. Returns the count, or -1 if it did not fit. */
++/* Every name in the open directory into the arena, sorted. Returns -1 if full or -2 on a read error. */
+ static long
+-gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t mark_n)
++gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_n)
+ {
+ 	off_t position = 0;
+ 	ssize_t n;
+@@ -736,8 +759,6 @@ gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t ma
+ 				continue;
+ 			}
+ 			if (arena_used + len + 1 > NAME_ARENA || names_used >= NAME_MAX_NAMES) {
+-				arena_used = mark_a;
+-				names_used = mark_n;
+ 				return -1;
+ 			}
+ 			name_at[names_used++] = (uint32_t)arena_used;
+@@ -745,10 +766,68 @@ gather_names(int dir_fd, char *buf, size_t bufsize, uint64_t mark_a, uint64_t ma
+ 			arena_used += len + 1;
+ 		}
+ 	}
++	if (n < 0) {
++		return -2;
++	}
+ 	sort_names(name_at + mark_n, names_used - mark_n);
+ 	return (long)(names_used - mark_n);
+ }
+ 
++static int pack_tree(const char *relative);
++
++static int
++pack_child(const char *relative, const char *name)
++{
++	char child[MAX_PATH];
++	size_t base = strlen(path), rbase = strlen(relative), len = strlen(name);
++	int ok;
++
++	if (base + 1 + len >= MAX_PATH) {
++		printf("var_store: %s/%s: the path is too long\n", path, name);
++		return 1;
++	}
++	path[base] = '/';
++	memcpy(path + base + 1, name, len + 1);
++	if (rbase > 0) {
++		memcpy(child, relative, rbase);
++		child[rbase++] = '/';
++	}
++	memcpy(child + rbase, name, len + 1);
++	ok = pack_tree(child);
++	path[base] = 0;
++	return ok;
++}
++
++static int
++pack_unsorted(const char *relative, char *buf, size_t bufsize)
++{
++	int dir_fd = open(path, O_RDONLY | O_DIRECTORY, 0);
++	off_t position = 0;
++	ssize_t n;
++
++	if (dir_fd < 0) {
++		printf("var_store: %s: cannot reopen directory: %s\n", path, strerror(errno));
++		return 0;
++	}
++	while ((n = getdirentries(dir_fd, buf, bufsize, &position)) > 0) {
++		for (ssize_t i = 0; i < n;) {
++			struct dirent *d = (struct dirent *)(buf + i);
++			const char *name = d->d_name;
++
++			i += d->d_reclen;
++			if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0 && !pack_child(relative, name)) {
++				close(dir_fd);
++				return 0;
++			}
++		}
++	}
++	if (n < 0) {
++		printf("var_store: %s: cannot read directory: %s\n", path, strerror(errno));
++	}
++	close(dir_fd);
++	return n == 0;
++}
++
+ /* relative: the path under ROOT, "" for ROOT itself. path holds the whole of it. */
+ static int
+ pack_tree(const char *relative)
+@@ -756,7 +835,6 @@ pack_tree(const char *relative)
+ 	static char dirbuf[MAX_DEPTH][4096];    /* one read buffer a level */
+ 	static int depth;
+ 	struct stat st;
+-	size_t base = strlen(path), rbase = strlen(relative);
+ 	int dir_fd, ok = 1;
+ 
+ 	if (lstat(path, &st) != 0) {
+@@ -778,55 +856,66 @@ pack_tree(const char *relative)
+ 	depth++;
+ 	{
+ 		uint64_t mark_a = arena_used, mark_n = names_used;
+-		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_a, mark_n);
++		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_n);
+ 
+-		if (count < 0) {
+-			/* more names than the arena holds: this one goes in whatever order it is given */
++		if (count == -2) {
++			printf("var_store: %s: cannot read directory: %s\n", path, strerror(errno));
++			ok = 0;
++		}
++		close(dir_fd);
++		if (count == -1) {
++			/* The first pass ran out of space. Reopen and walk from the beginning. */
++			arena_used = mark_a;
++			names_used = mark_n;
+ 			unsorted_dirs++;
++			ok = pack_unsorted(relative, dirbuf[depth - 1], sizeof(dirbuf[0]));
+ 		}
+ 		for (long k = 0; ok && k < count; k++) {
+-			const char *name = name_arena + name_at[mark_n + k];
+-			char child[MAX_PATH];           /* the caller's while this one recurses: not static */
+-
+-			if (base + 1 + strlen(name) >= MAX_PATH || rbase + 1 + strlen(name) >= MAX_PATH) {
+-				printf("var_store: %s/%s: the path is too long\n", path, name);
+-				continue;
+-			}
+-			path[base] = '/';
+-			strcpy(path + base + 1, name);
+-			if (rbase > 0) {
+-				memcpy(child, relative, rbase);
+-				child[rbase] = '/';
+-				strcpy(child + rbase + 1, name);
+-			} else {
+-				strcpy(child, name);
+-			}
+-			ok = pack_tree(child);
+-			path[base] = 0;
++			ok = pack_child(relative, name_arena + name_at[mark_n + k]);
+ 		}
+ 		arena_used = mark_a;
+ 		names_used = mark_n;
+ 	}
+ 	depth--;
+-	close(dir_fd);
+ 	if (ok && relative[0] != 0 && lstat(path, &st) == 0) {
+ 		ok = pack_dirtime(relative, &st);
+ 	}
+ 	return ok;
+ }
+ 
++static int pass(const struct head *h, int make);
++
+ static int
+ save(void)
+ {
+-	struct head old, h;
+-	int slot, best;
++	struct head old, other, h;
++	int slot, best, other_ok, read_failed = 0;
++	uint64_t generation;
+ 	static uint8_t block[BLOCK];
+ 
+ 	memset(&old, 0, sizeof(old));
+-	best = newest(&old);
++	best = newest(&old, &read_failed);
++	if (read_failed) {
++		return 0;
++	}
+ 	slot = best < 0 ? 0 : (best + 1) % SLOTS;
++	generation = old.generation;
++	other_ok = best < 0 ? 0 : read_head(slot, &other);
++	if (other_ok < 0) {
++		return 0;
++	}
++	if (other_ok > 0 && !pass(&old, 0)) {
++		if (!pass(&other, 0)) {
++			printf("var_store: neither existing archive could be verified; both slots are left intact\n");
++			return 0;
++		}
++		/* Overwrite the damaged archive and keep the verified fallback. */
++		slot = best;
++		best = (int)other.slot;
++		old = other;
++	}
+ 	printf("var_store: saving into slot %d (slot %d holds generation %llu)\n", slot, best,
+-	    best < 0 ? 0ULL : (unsigned long long)old.generation);
++	    (unsigned long long)old.generation);
+ 
+ 	/* the slot's header first, so that a save cut short cannot leave an old header over a new archive */
+ 	memset(block, 0, sizeof(block));
+@@ -835,7 +924,7 @@ save(void)
+ 	}
+ 	stream_start(slot, 0);
+ 	entries = 0;
+-	last_saved_at = best < 0 ? 0 : old.seconds;
++	last_saved_at = old.seconds;
+ 	changed_entries = changed_bytes = 0;
+ 	skipped_blocks = written_blocks = 0;
+ 	arena_used = names_used = unsorted_dirs = 0;
+@@ -850,7 +939,7 @@ save(void)
+ 	memcpy(h.magic, HEAD_MAGIC, sizeof(h.magic));
+ 	h.version = HEAD_VERSION;
+ 	h.slot = (uint32_t)slot;
+-	h.generation = (best < 0 ? 0 : old.generation) + 1;
++	h.generation = generation + 1;
+ 	h.bytes = stream_bytes;
+ 	h.entries = entries;
+ 	{
+@@ -903,11 +992,14 @@ static uint64_t retry_ms_left = RETRY_MS;
+ static int
+ whole_path(const char *relative, uint32_t len)
+ {
+-	if (len == 0 || len >= MAX_PATH - sizeof(ROOT) - 1 || relative[0] == '/') {
++	if (len == 0 || len >= MAX_PATH - sizeof(ROOT) || relative[0] == '/') {
+ 		return 0;
+ 	}
+-	for (uint32_t i = 0; i + 1 < len; i++) {
+-		if (relative[i] == '.' && relative[i + 1] == '.' &&
++	for (uint32_t i = 0; i < len; i++) {
++		if (relative[i] == '\0') {
++			return 0;
++		}
++		if (i + 1 < len && relative[i] == '.' && relative[i + 1] == '.' &&
+ 		    (i == 0 || relative[i - 1] == '/') && (i + 2 == len || relative[i + 2] == '/')) {
+ 			return 0;       /* nothing of this archive is unpacked outside ROOT */
+ 		}
+@@ -930,6 +1022,23 @@ set_times(const struct entry *e)
+ 	utimes(path, times);
+ }
+ 
++static void
++restore_link_xattrs(uint64_t used, char *name)
++{
++	for (uint64_t offset = 0; offset < used;) {
++		uint32_t namelen, vlen;
++
++		memcpy(&namelen, xpack + offset, sizeof(namelen));
++		memcpy(&vlen, xpack + offset + 4, sizeof(vlen));
++		offset += 8;
++		memcpy(name, xpack + offset, namelen);
++		name[namelen] = 0;
++		offset += namelen;
++		setxattr(path, name, xpack + offset, vlen, 0, XATTR_NOFOLLOW);
++		offset += vlen;
++	}
++}
++
+ /*
+  * One entry out of the archive and into /private/var. make: with 0, the entry is only read past
+  * (the first pass, which proves the archive's checksum before anything is made).
+@@ -941,6 +1050,7 @@ unpack_one(int make)
+ 	static char relative[MAX_PATH];
+ 	static uint8_t value[MAX_XATTR];
+ 	static char name[1024];
++	uint64_t link_xattrs = 0;
+ 	int out_fd = -1, ok = 1;
+ 
+ 	if (!in(&e, sizeof(e))) {
+@@ -985,9 +1095,14 @@ unpack_one(int make)
+ 			ok = 0;
+ 			break;
+ 		}
+-		if (namelen >= sizeof(name) || vlen > sizeof(value)) {
+-			ok = in_skip(namelen) && in_skip(vlen);
+-			skipped_big++;
++		if (!make || namelen >= sizeof(name) || vlen > sizeof(value)) {
++			if (!in_skip((uint64_t)namelen + vlen)) {
++				ok = 0;
++				break;
++			}
++			if (make) {
++				skipped_big++;
++			}
+ 			continue;
+ 		}
+ 		if (!in(name, namelen) || !in(value, vlen)) {
+@@ -995,7 +1110,11 @@ unpack_one(int make)
+ 			break;
+ 		}
+ 		name[namelen] = 0;
+-		if (make && e.kind != ENT_HARDLINK) {
++		if (e.kind == ENT_SYMLINK) {
++			if (!buffer_xattr(&link_xattrs, name, namelen, value, vlen)) {
++				skipped_big++;
++			}
++		} else if (e.kind != ENT_HARDLINK) {
+ 			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
+ 		}
+ 	}
+@@ -1005,6 +1124,9 @@ unpack_one(int make)
+ 		}
+ 		return 0;
+ 	}
++	if (!make && (e.kind == ENT_FILE || e.kind == ENT_SYMLINK || e.kind == ENT_HARDLINK)) {
++		return in_skip(e.size) && in_pad();
++	}
+ 	/* the contents */
+ 	if (e.kind == ENT_FILE) {
+ 		static uint8_t piece[256 * 1024];
+@@ -1063,6 +1185,7 @@ unpack_one(int make)
+ 				/* a name the skeleton made too comes out as the store has it */
+ 				unlink(path);
+ 				if (symlink(target, path) == 0) {
++					restore_link_xattrs(link_xattrs, name);
+ 					made_links++;
+ 				}
+ 			} else if (make) {
+@@ -1151,11 +1274,14 @@ static int
+ load(void)
+ {
+ 	struct head h;
+-	int best;
++	int best, read_failed = 0;
+ 
+ 	memset(&h, 0, sizeof(h));
+-	best = newest(&h);
++	best = newest(&h, &read_failed);
+ 	if (best < 0) {
++		if (read_failed) {
++			return 0;
++		}
+ 		printf("var_store: no store yet: /private/var stays as init made it\n");
+ 		return 1;
+ 	}
+@@ -1169,7 +1295,7 @@ load(void)
+ 
+ 		/* the newest is torn: the one before it, which a save never touches, may still be whole */
+ 		for (int slot = 0; slot < SLOTS; slot++) {
+-			if (slot != best && read_head(slot, &other) && pass(&other, 0)) {
++			if (slot != best && read_head(slot, &other) > 0 && pass(&other, 0)) {
+ 				left = slot;
+ 				break;
+ 			}
+@@ -1196,14 +1322,17 @@ load(void)
+ 	return 1;
+ }
+ 
+-static void
++static int
+ show(void)
+ {
++	int ok = 1;
++
+ 	for (int slot = 0; slot < SLOTS; slot++) {
+ 		static uint8_t block[BLOCK];
+ 		struct head *h = (struct head *)block;
+ 
+ 		if (!device_read(slot_at(slot), block, BLOCK)) {
++			ok = 0;
+ 			continue;
+ 		}
+ 		if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0) {
+@@ -1215,6 +1344,7 @@ show(void)
+ 		    (unsigned long long)h->entries, (unsigned long long)h->bytes, h->crc,
+ 		    (unsigned long long)h->seconds, h->head_crc == head_checksum(h) ? "right" : "WRONG");
+ 	}
++	return ok;
+ }
+ 
+ static int
+@@ -1254,8 +1384,11 @@ save_once(void)
+ 		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
+ 		return 0;
+ 	}
+-	ok = claim() && save();
+-	release();
++	ok = 0;
++	if (claim()) {
++		ok = save();
++		release();
++	}
+ 	close(fd);
+ 	fd = -1;
+ 	return ok;
+@@ -1275,7 +1408,7 @@ watch(int seconds)
  	}
  	close(fd);
  	fd = -1;
@@ -1662,7 +2419,7 @@ index 84f246b..b2e0cd3 100644
  		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
  		return 0;
  	}
-@@ -1291,7 +1291,7 @@ watch(int seconds)
+@@ -1291,7 +1424,7 @@ watch(int seconds)
  		struct timeval tv = { 0, 0 };
  		int state = VAR_SAVE_NONE;
  
@@ -1671,7 +2428,7 @@ index 84f246b..b2e0cd3 100644
  			asked = 1;
  		}
  		gettimeofday(&tv, NULL);
-@@ -1304,7 +1304,7 @@ watch(int seconds)
+@@ -1304,7 +1437,7 @@ watch(int seconds)
  			last = (uint64_t)tv.tv_sec;
  			if (asked) {
  				/* answered either way: the kernel is waiting on this to go back to the loader */
@@ -1680,12 +2437,37 @@ index 84f246b..b2e0cd3 100644
  				return ok;
  			}
  		}
-diff --git a/userland/var/mobile/Library/Preferences/com.apple.migration.plist b/userland/var/mobile/Library/Preferences/com.apple.migration.plist
-index 0a3f423..d3b80e3 100644
-Binary files a/userland/var/mobile/Library/Preferences/com.apple.migration.plist and b/userland/var/mobile/Library/Preferences/com.apple.migration.plist differ
-diff --git a/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist b/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist
-index a8908e4..3251557 100644
-Binary files a/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist and b/userland/var/mobile/Library/Preferences/com.apple.purplebuddy.plist differ
-diff --git a/userland/var/mobile/Library/Preferences/com.apple.springboard.plist b/userland/var/mobile/Library/Preferences/com.apple.springboard.plist
-index dc39f07..7f6b71c 100644
-Binary files a/userland/var/mobile/Library/Preferences/com.apple.springboard.plist and b/userland/var/mobile/Library/Preferences/com.apple.springboard.plist differ
+@@ -1383,23 +1516,25 @@ main(int argc, char **argv, char **envp)
+ 		}
+ 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+ 	}
++	if (strcmp(what, "save") == 0) {
++		return save_once() ? 0 : 1;
++	}
+ 	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
+ 	if (fd < 0) {
+ 		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
+ 		    strerror(errno));
+ 		return 1;
+ 	}
+-	if (strcmp(what, "save") == 0) {
+-		ok = claim() && save();
+-		release();
+-	} else if (strcmp(what, "load") == 0) {
++	if (strcmp(what, "load") == 0) {
+ 		ok = load();
+ 	} else if (strcmp(what, "erase") == 0) {
+-		ok = claim() && erase();        /* a write like any other: the claim first */
+-		release();
++		ok = 0;
++		if (claim()) {
++			ok = erase();
++			release();
++		}
+ 	} else {
+-		show();
+-		ok = 1;
++		ok = show();
+ 	}
+ 	close(fd);
+ 	return ok ? 0 : 1;
